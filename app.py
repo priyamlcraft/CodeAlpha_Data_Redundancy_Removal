@@ -1,8 +1,9 @@
-import streamlit as st
-import pandas as pd
-import sqlite3
 import re
+import sqlite3
 from datetime import datetime
+
+import pandas as pd
+import streamlit as st
 
 # ================= PAGE CONFIG =================
 
@@ -188,9 +189,59 @@ create_table()
 
 # ================= VALIDATION =================
 
+
+# ================= VALIDATION =================
+
 def validate_email(email):
     pattern = r"^[\w\.-]+@[\w\.-]+\.\w+$"
     return bool(re.match(pattern, email))
+
+
+def normalize_email(email):
+    return str(email).strip().lower()
+
+
+def normalize_phone(phone):
+    """
+    Normalize phone numbers for duplicate comparison.
+    Removes spaces, hyphens, brackets and other separators.
+    """
+    phone = str(phone).strip()
+
+    if not phone:
+        return ""
+
+    return re.sub(r"\D", "", phone)
+
+
+def is_duplicate_record(cursor, email, phone):
+    """
+    A record is duplicate if its email OR non-empty
+    normalized phone number already exists.
+    """
+
+    email = normalize_email(email)
+    phone = normalize_phone(phone)
+
+    existing_records = cursor.execute(
+        "SELECT email, phone FROM records"
+    ).fetchall()
+
+    for existing_email, existing_phone in existing_records:
+
+        if normalize_email(existing_email) == email:
+            return True
+
+        if (
+            phone
+            and normalize_phone(existing_phone) == phone
+        ):
+            return True
+
+    return False
+
+
+# ================= ADD RECORD =================
 
 
 # ================= ADD RECORD =================
@@ -198,7 +249,7 @@ def validate_email(email):
 def add_record(name, email, phone):
 
     name = str(name).strip()
-    email = str(email).strip().lower()
+    email = normalize_email(email)
     phone = str(phone).strip()
 
     if not name or not email:
@@ -211,6 +262,10 @@ def add_record(name, email, phone):
 
     try:
         cursor = conn.cursor()
+
+        # Check duplicate email OR phone
+        if is_duplicate_record(cursor, email, phone):
+            return "duplicate"
 
         cursor.execute("""
             INSERT INTO records
@@ -254,8 +309,12 @@ def get_records():
 
 # ================= CSV CLEANING =================
 
+
+# ================= CSV CLEANING =================
+
 def clean_dataframe(df):
 
+    df = df.copy()
     df.columns = df.columns.str.strip().str.lower()
 
     required_columns = ["name", "email", "phone"]
@@ -265,14 +324,20 @@ def clean_dataframe(df):
 
     df = df[required_columns].copy()
 
-    df["name"] = df["name"].fillna("").astype(str).str.strip()
-    df["email"] = (
-        df["email"].fillna("").astype(str).str.strip().str.lower()
+    # Clean and normalize values
+    df["name"] = (
+        df["name"].fillna("").astype(str).str.strip()
     )
-    df["phone"] = df["phone"].fillna("").astype(str).str.strip()
+
+    df["email"] = df["email"].apply(normalize_email)
+
+    df["phone"] = (
+        df["phone"].fillna("").astype(str).str.strip()
+    )
 
     original_count = len(df)
 
+    # Remove invalid records
     df = df[
         (df["name"] != "") &
         (df["email"] != "") &
@@ -281,16 +346,30 @@ def clean_dataframe(df):
 
     invalid_count = original_count - len(df)
 
-    before = len(df)
+    # Normalize phone numbers only for comparison
+    phone_keys = df["phone"].apply(normalize_phone)
 
-    df = df.drop_duplicates(
-        subset=["email"],
-        keep="first"
+    # Find duplicate emails
+    duplicate_email = df["email"].duplicated(keep="first")
+
+    # Find duplicate non-empty phone numbers
+    duplicate_phone = (
+        phone_keys.ne("") &
+        phone_keys.duplicated(keep="first")
     )
 
-    duplicate_count = before - len(df)
+    # Remove records matching either condition
+    duplicate_mask = duplicate_email | duplicate_phone
+
+    duplicate_count = int(duplicate_mask.sum())
+
+    df = df.loc[~duplicate_mask].copy()
 
     return df, duplicate_count, invalid_count
+
+
+
+# ================= CSV IMPORT =================
 
 
 # ================= CSV IMPORT =================
@@ -307,6 +386,14 @@ def save_csv_records(df):
 
         for _, row in df.iterrows():
 
+            email = normalize_email(row["email"])
+            phone = str(row["phone"]).strip()
+
+            # Check against existing database records
+            if is_duplicate_record(cursor, email, phone):
+                existing += 1
+                continue
+
             try:
                 cursor.execute("""
                     INSERT INTO records
@@ -314,8 +401,8 @@ def save_csv_records(df):
                     VALUES (?, ?, ?, ?)
                 """, (
                     row["name"],
-                    row["email"],
-                    row["phone"],
+                    email,
+                    phone,
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 ))
 
@@ -325,6 +412,10 @@ def save_csv_records(df):
                 existing += 1
 
         conn.commit()
+
+    except sqlite3.Error:
+        conn.rollback()
+        raise
 
     finally:
         conn.close()
@@ -464,8 +555,9 @@ with st.container(border=True):
             elif result == "duplicate":
 
                 st.warning(
-                    "Duplicate detected! This email already exists."
-                )
+                    "Duplicate detected! A record with this email "
+                    "or phone number already exists."
+        )
 
             elif result == "invalid_email":
 
